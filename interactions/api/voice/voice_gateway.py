@@ -458,6 +458,9 @@ class VoiceGateway(WebsocketClient):
 
         if needs_encode:
             data = encoder.encode(data)
+
+        if self.dave_protocol_version != 0 and self.dave_session is not None and self.dave_session.ready:
+            data = self.dave_session.encrypt_opus(data)
         packet = self.generate_packet(data)
 
         _, writable, _ = select.select([], [self.socket], [], 0)
