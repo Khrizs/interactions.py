@@ -136,7 +136,6 @@ class VoiceGateway(WebsocketClient):
                 # for it to complete before receiving more - that way there's less
                 # possible race conditions to consider.
                 await self.dispatch_opcode(data, op)
-            
 
     async def receive(self, force=False) -> dict | bytes:  # noqa: C901
         buffer = bytearray()
@@ -280,7 +279,7 @@ class VoiceGateway(WebsocketClient):
                 if self.dave_session is not None:
                     self.logger.debug(f"Preparing for DAVE epoch {data['epoch']}")
                     # When the epoch ID is equal to 1, this message indicates that a new MLS group is to be created for the given protocol version.
-                    if data["transition_id"] == 1:
+                    if data["epoch"] == 1:
                         self.dave_protocol_version = data["protocol_version"]
                         await self._reinit_dave_session()
 
@@ -569,7 +568,7 @@ class VoiceGateway(WebsocketClient):
                 return self.logger.warning(f"Received execute transition, but we don't have a pending transition for {transition_id}")
 
             old_version = self.dave_session.protocol_version
-            self.dave_session.protocol_version = self.dave_pending_transitions.pop(transition_id)
+            self.dave_protocol_version = self.dave_pending_transitions.pop(transition_id)
             
             if old_version != self.dave_protocol_version and self.dave_protocol_version == 0:
                 self.dave_downgraded = True
