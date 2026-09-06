@@ -96,6 +96,14 @@ class ActiveVoiceState(VoiceState):
     def gateway(self) -> "GatewayClient":
         return self._client.get_guild_websocket(self._guild_id)
 
+    @property
+    def voice_privacy_code(self) -> Optional[str]:
+        """Get the voice privacy code for this voice DAVE session's group."""
+        if self.ws is not None:
+            if self.ws.dave_session:
+                return self.ws.dave_session.voice_privacy_code
+        return None
+
     async def wait_for_stopped(self) -> None:
         """Wait for the player to stop playing."""
         if self.player:

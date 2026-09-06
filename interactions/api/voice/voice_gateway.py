@@ -10,6 +10,13 @@ from threading import Event
 import select
 from aiohttp import WSMsgType
 
+try:
+    import davey
+
+    davey_imported = True
+except ImportError:
+    davey_imported = False
+
 from interactions.api.gateway.websocket import WebsocketClient
 from interactions.api.voice.encryption import Encryption
 from interactions.client.const import MISSING
@@ -30,7 +37,19 @@ class OP(IntEnum):
     RESUME = 7
     HELLO = 8
     RESUMED = 9
+    CLIENTS_CONNECT = 11
     CLIENT_DISCONNECT = 13
+    DAVE_PREPARE_TRANSITION = 21
+    DAVE_EXECUTE_TRANSITION = 22
+    DAVE_TRANSITION_READY = 23
+    DAVE_PREPARE_EPOCH = 24
+    DAVE_MLS_EXTERNAL_SENDER = 25
+    DAVE_MLS_KEY_PACKAGE = 26
+    DAVE_MLS_PROPOSALS = 27
+    DAVE_MLS_COMMIT_WELCOME = 28
+    DAVE_MLS_ANNOUNCE_COMMIT_TRANSITION = 29
+    DAVE_MLS_WELCOME = 30
+    DAVE_MLS_INVALID_COMMIT_WELCOME = 31
 
 
 class VoiceGateway(WebsocketClient):
@@ -51,14 +70,25 @@ class VoiceGateway(WebsocketClient):
     ready: Event
 
     def __init__(self, state, voice_state: dict, voice_server: dict) -> None:
+        if not davey_imported:
+            raise RuntimeError("Please install interactions[voice] to use voice components.")
+        
         super().__init__(state)
 
         self._voice_server_update = asyncio.Event()
-        self.ws_url = f"wss://{voice_server['endpoint']}?v=4"
+        self.ws_url = f"wss://{voice_server['endpoint']}?v=8"
         self.session_id = voice_state["session_id"]
+        self.seq_ack:int = -1
         self.token = voice_server["token"]
         self.secret: str | None = None
         self.guild_id = voice_server["guild_id"]
+        self.channel_id:int = int(voice_state["channel_id"])
+        self.user_id:int = int(voice_state["user_id"])
+
+        self.dave_protocol_version = davey.DAVE_PROTOCOL_VERSION
+        self.dave_session: davey.DaveSession | None = None
+        self.dave_pending_transitions = {}
+        self.dave_downgraded: bool = False
 
         self.sock_sequence = 0
         self.timestamp = 0
@@ -90,17 +120,25 @@ class VoiceGateway(WebsocketClient):
                 receiving.cancel()
                 return
 
-            op = msg.get("op")
-            data = msg.get("d")
-            if seq := msg.get("s"):
-                self.sequence = seq
+            if isinstance(msg, bytes):
+                op = msg[2]
+                if seq := struct.unpack_from(">H", msg, 0)[0]:
+                    self.seq_ack = seq
 
-            # This may try to reconnect the connection so it is best to wait
-            # for it to complete before receiving more - that way there's less
-            # possible race conditions to consider.
-            await self.dispatch_opcode(data, op)
+                await self.dispatch_binary_opcode(msg, op)
+            else:
+                op = msg.get("op")
+                data = msg.get("d")
+                if seq := msg.get("seq"):
+                    self.seq_ack = seq
+    
+                # This may try to reconnect the connection so it is best to wait
+                # for it to complete before receiving more - that way there's less
+                # possible race conditions to consider.
+                await self.dispatch_opcode(data, op)
+            
 
-    async def receive(self, force=False) -> str:  # noqa: C901
+    async def receive(self, force=False) -> dict | bytes:  # noqa: C901
         buffer = bytearray()
 
         while True:
@@ -148,24 +186,27 @@ class VoiceGateway(WebsocketClient):
             if resp.data is None:
                 continue
 
-            if isinstance(resp.data, bytes):
-                buffer.extend(resp.data)
-
-                if len(resp.data) < 4 or resp.data[-4:] != b"\x00\x00\xff\xff":
-                    # message isn't complete yet, wait
-                    continue
-
-                msg = self._zlib.decompress(buffer)
-                msg = msg.decode("utf-8")
+            if resp.type is WSMsgType.BINARY:
+                return resp.data
             else:
-                msg = resp.data
+                if isinstance(resp.data, bytes):
+                    buffer.extend(resp.data)
 
-            try:
-                msg = FastJson.loads(msg)
-            except Exception as e:
-                self.logger.error(e)
+                    if len(resp.data) < 4 or resp.data[-4:] != b"\x00\x00\xff\xff":
+                        # message isn't complete yet, wait
+                        continue
 
-            return msg
+                    msg = self._zlib.decompress(buffer)
+                    msg = msg.decode("utf-8")
+                else:
+                    msg = resp.data
+
+                try:
+                    msg = FastJson.loads(msg)
+                except Exception as e:
+                    self.logger.error(e)
+
+                return msg
 
     async def dispatch_opcode(self, data, op) -> None:
         match op:
@@ -203,6 +244,11 @@ class VoiceGateway(WebsocketClient):
                 except Exception as e:
                     self.logger.error(f"Failed to initialize encryption: {e}", exc_info=True)
                     raise
+
+                self.dave_protocol_version = data["dave_protocol_version"]
+                if self.dave_protocol_version > 0:
+                    await self._reinit_dave_session()
+
                 self.ready.set()
                 if self.cond:
                     with self.cond:
@@ -213,9 +259,79 @@ class VoiceGateway(WebsocketClient):
                 self.logger.debug(
                     f"User {data['user_id']} has disconnected from voice, ssrc ({self.user_ssrc_map.pop(data['user_id'], MISSING)}) invalidated"
                 )
+            case OP.DAVE_PREPARE_TRANSITION:
+                if self.dave_session is not None:
+                    self.logger.debug(f"Preparing DAVE transition {data['transition_id']} on protocol version {data['protocol_version']}")
+                    self.dave_pending_transitions[data["transition_id"]] = data["protocol_version"]
+
+                    # Transition ID 0 Indicates immediate transition
+                    if data["transition_id"] == 0:
+                        await self._execute_pending_transition(data["transition_id"])
+                    else:
+                        if data["protocol_version"] == 0:
+                            self.dave_session.set_passthrough_mode(True, 30)
+
+                        await self._send_dave_transition_ready(data["transition_id"])
+            case OP.DAVE_EXECUTE_TRANSITION:
+                if self.dave_session is not None:
+                    self.logger.debug(f"Executing DAVE transition {data['transition_id']}")
+                    await self._execute_pending_transition(data["transition_id"])
+            case OP.DAVE_PREPARE_EPOCH:
+                if self.dave_session is not None:
+                    self.logger.debug(f"Preparing for DAVE epoch {data['epoch']}")
+                    # When the epoch ID is equal to 1, this message indicates that a new MLS group is to be created for the given protocol version.
+                    if data["transition_id"] == 1:
+                        self.dave_protocol_version = data["protocol_version"]
+                        await self._reinit_dave_session()
 
             case _:
                 return self.logger.debug(f"Unhandled OPCODE: {op} = {data = }")
+
+    async def dispatch_binary_opcode(self, msg: bytes, op) -> None:
+        match op:
+            case OP.DAVE_MLS_EXTERNAL_SENDER:
+                if self.dave_session is not None:
+                    self.dave_session.set_external_sender(msg[3:])
+                    self.logger.debug("Setting DAVE MLS External Sender")
+            case OP.DAVE_MLS_PROPOSALS:
+                if self.dave_session is not None:
+                    op_type = davey.ProposalsOperationType.append if msg[3] == 0 else davey.ProposalsOperationType.revoke
+                    proposal_result = self.dave_session.process_proposals(op_type, msg[4:])
+
+                    if isinstance(proposal_result, davey.CommitWelcome):
+                        payload = proposal_result.commit + proposal_result.welcome if proposal_result.welcome else proposal_result.commit
+                        await self.send_binary(bytes([OP.DAVE_MLS_COMMIT_WELCOME]) + payload)
+
+                    self.logger.debug(f"Processed DAVE MLS Proposals")
+            case OP.DAVE_MLS_ANNOUNCE_COMMIT_TRANSITION:
+                if self.dave_session is not None:
+                    transition_id = struct.unpack_from(">H", msg, 3)[0]
+
+                    try:
+                        self.dave_session.process_commit(msg[5:])
+                        if transition_id != 0:
+                            self.dave_pending_transitions[transition_id] = self.dave_protocol_version
+                            await self._send_dave_transition_ready(transition_id)
+                            
+                        self.logger.debug(f"DAVE MLS Commit Transition processed for transition id {transition_id}")
+                    except Exception:
+                        await self._recover_from_mls_invalid_commit(transition_id)
+            case OP.DAVE_MLS_WELCOME:
+                if self.dave_session is not None:
+                    transition_id = struct.unpack_from(">H", msg, 3)[0]
+
+                    try:
+                        self.dave_session.process_welcome(msg[5:])
+                        if transition_id != 0:
+                            self.dave_pending_transitions[transition_id] = self.dave_protocol_version
+                            await self._send_dave_transition_ready(transition_id)
+
+                        self.logger.debug(f"DAVE MLS Welcome processed for transition id {transition_id}")
+                    except Exception:
+                        await self._recover_from_mls_invalid_commit(transition_id)
+
+            case _:
+                return self.logger.debug(f"Unhandled OPCODE: {op} = {msg = }")
 
     async def reconnect(self, *, resume: bool = False, code: int = 1012) -> None:
         async with self._race_lock:
@@ -261,7 +377,7 @@ class VoiceGateway(WebsocketClient):
 
         payload = {
             "op": OP.RESUME,
-            "d": {"server_id": self.guild_id, "session_id": self.session_id, "token": self.token},
+            "d": {"server_id": self.guild_id, "session_id": self.session_id, "token": self.token, "seq_ack": self.seq_ack},
         }
         await self.ws.send_json(payload)
 
@@ -355,7 +471,7 @@ class VoiceGateway(WebsocketClient):
         self.timestamp += encoder.samples_per_frame
 
     async def send_heartbeat(self) -> None:
-        await self.send_json({"op": OP.HEARTBEAT, "d": random.getrandbits(64)})
+        await self.send_json({"op": OP.HEARTBEAT, "d": {"t": random.getrandbits(64), "seq_ack": self.seq_ack}})
         self.logger.debug("❤ Voice Connection is sending Heartbeat")
 
     async def _identify(self) -> None:
@@ -367,10 +483,10 @@ class VoiceGateway(WebsocketClient):
                 "user_id": self.state.client.user.id,
                 "session_id": self.session_id,
                 "token": self.token,
+                "max_dave_protocol_version": self.dave_protocol_version,
             },
         }
-        serialized = FastJson.dumps(payload)
-        await self.ws.send_str(serialized)
+        await self.send_json(payload)
 
         self.logger.debug("Voice Connection has identified itself to Voice Gateway")
 
@@ -401,7 +517,7 @@ class VoiceGateway(WebsocketClient):
                 "ssrc": self.ssrc,
             },
         }
-        await self.ws.send_json(payload)
+        await self.send_json(payload)
 
     def set_new_voice_server(self, payload: dict) -> None:
         """
@@ -411,7 +527,66 @@ class VoiceGateway(WebsocketClient):
             payload: New voice server connection data
 
         """
-        self.ws_url = f"wss://{payload['endpoint']}?v=4"
+        self.ws_url = f"wss://{payload['endpoint']}?v=8"
         self.token = payload["token"]
         self.guild_id = payload["guild_id"]
         self._voice_server_update.set()
+
+    async def _reinit_dave_session(self) -> None:
+        """Reinitialize the DAVE session with the current voice connection"""
+        if self.dave_protocol_version > 0:
+            if self.dave_session:
+                self.dave_session.reinit(self.dave_protocol_version, self.user_id, self.channel_id)
+                self.logger.debug(f"DAVE session reinitialized for protocol version {self.dave_protocol_version}")
+            else:
+                self.dave_session = davey.DaveSession(self.dave_protocol_version, self.user_id, self.channel_id)
+                self.logger.debug(f"DAVE session initialized for protocol version {self.dave_protocol_version}")
+
+            await self.send_binary(bytes([OP.DAVE_MLS_KEY_PACKAGE]) + self.dave_session.get_serialized_key_package())
+        else:
+            dave_session_existed = self.dave_session is not None
+            if self.dave_session:
+                self.dave_session.reset()
+                if dave_session_existed:
+                    self.dave_session.set_passthrough_mode(True, 10)
+                    self.logger.debug("DAVE session reset")
+
+    async def _send_dave_transition_ready(self, transition_id: int) -> None:
+        """Send the DAVE transition ready message"""
+        if self.dave_session is not None:
+            payload = {
+                "op": OP.DAVE_TRANSITION_READY,
+                "d": {
+                    "transition_id": transition_id,
+                },
+            }
+            await self.send_json(payload)
+
+    async def _execute_pending_transition(self, transition_id: int) -> None:
+        """Execute a pending DAVE transition"""
+        if self.dave_session is not None:
+            if transition_id not in self.dave_pending_transitions:
+                return self.logger.warning(f"Received execute transition, but we don't have a pending transition for {transition_id}")
+
+            old_version = self.dave_session.protocol_version
+            self.dave_session.protocol_version = self.dave_pending_transitions.pop(transition_id)
+            
+            if old_version != self.dave_protocol_version and self.dave_protocol_version == 0:
+                self.dave_downgraded = True
+                self.logger.debug(f"DAVE protocol downgraded")
+            elif transition_id > 0 and self.dave_downgraded:
+                self.dave_downgraded = False
+                self.dave_session.set_passthrough_mode(True)
+                self.logger.debug(f"DAVE protocol upgraded")
+
+            self.logger.debug(f"DAVE transition executed ID: {transition_id} to protocol version v{self.dave_protocol_version} from v{old_version}")
+
+    async def _recover_from_mls_invalid_commit(self, transition_id: int) -> None:
+        payload = {
+            "op": OP.DAVE_MLS_INVALID_COMMIT_WELCOME,
+            "d": {
+                "transition_id": transition_id,
+            },
+        }
+        await self.send_json(payload)
+        await self._reinit_dave_session()

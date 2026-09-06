@@ -152,6 +152,25 @@ class WebsocketClient:
 
             await self.ws.send_str(data)
 
+    async def send_binary(self, data: bytes, bypass=False) -> None:
+            """
+            Send binary data to the websocket.
+
+            Args:
+                data: The data to send
+                bypass: Should the rate limit be ignored for this send (used for heartbeats)
+    
+            """
+            self.logger.debug(f"Sending data to websocket: {data}")
+    
+            async with self._race_lock:
+                if self.ws is None:
+                    return self.logger.warning("Attempted to send data while websocket is not connected!")
+                if not bypass:
+                    await self.rl_manager.rate_limit()
+    
+                await self.ws.send_bytes(data)
+
     async def send_json(self, data: dict, bypass=False) -> None:
         """
         Send JSON data to the websocket.
